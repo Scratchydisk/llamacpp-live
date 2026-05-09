@@ -118,18 +118,30 @@ class TrackerApp:
             if current_times:
                 self._last_cpu_times = current_times
 
-        load_1, load_5, load_15 = os.getloadavg()
+        loads = self._get_load_averages()
         cpu_count = os.cpu_count()
-        return {
+        status: dict[str, Any] = {
             "model": cpu_model_name(),
             "logical_cpus": cpu_count,
-            "load_1m": load_1,
-            "load_5m": load_5,
-            "load_15m": load_15,
-            "load_1m_per_cpu": load_1 / cpu_count if cpu_count else None,
             "cpu_percent": cpu_percent,
             "updated_at_unix": time.time(),
         }
+        if loads is not None:
+            load_1, load_5, load_15 = loads
+            status["load_1m"] = load_1
+            status["load_5m"] = load_5
+            status["load_15m"] = load_15
+            if cpu_count:
+                status["load_1m_per_cpu"] = load_1 / cpu_count
+        return status
+
+    def _get_load_averages(self) -> tuple[float, float, float] | None:
+        if hasattr(os, "getloadavg"):
+            try:
+                return os.getloadavg()
+            except OSError:
+                return None
+        return None
 
     def _read_log(self) -> None:
         if self.stream is not None:
