@@ -207,8 +207,10 @@ class LlamaLogParser:
                 task = self._find_task_by_task_id(int(match.group("task")))
                 if task:
                     task.status = "cancelled"
+                    task.completed_at = now_iso()
                     task.touch(line, "cancelled")
                     self.state.counters["cancelled"] += 1
+                    self._complete_task(task)
                     return self._event("cancelled", line, task=task.to_dict())
 
         return self._event("line", line)
@@ -466,6 +468,8 @@ class LlamaLogParser:
             return self._event(event, line, slot_id=slot_id)
 
         task = self._get_task(slot_id, task_id)
+        if task is None:
+            return self._event(event, line, slot_id=slot_id, terminated=True)
         task.touch(line, event)
 
         if "processing task" in body:
@@ -554,10 +558,13 @@ class LlamaLogParser:
         task.touch(line, "timing")
         return self._event("timing", line, task=task.to_dict())
 
-    def _get_task(self, slot_id: int, task_id: int) -> Task:
+    def _get_task(self, slot_id: int, task_id: int) -> Task | None:
         key = self._key(slot_id, task_id)
         task = self.state.active.get(key)
         if task is None:
+            for completed in self.state.completed:
+                if completed.slot_id == slot_id and completed.task_id == task_id:
+                    return None
             task = Task(slot_id=slot_id, task_id=task_id)
             self.state.active[key] = task
             self.state.counters["tasks"] += 1
