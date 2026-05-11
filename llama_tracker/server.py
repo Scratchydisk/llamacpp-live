@@ -235,6 +235,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(content_length))
+        self.send_header("Cache-Control", "no-store")
         if cors:
             self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
@@ -380,7 +381,7 @@ INDEX_HTML = """<!doctype html>
 
 WIDGET_JS = """
 const DEFAULT_UI = { completedFilter: "all", completedLimit: "8", metadataOpen: false };
-const COST_DEFAULTS = { pricePerKwh: 25.5, cpuBaseW: 130 };
+const COST_DEFAULTS = { pricePerKwh: 25.5, cpuBaseW: 130, baselineW: 80 };
 const state = {
   data: null,
   history: { cpu: [], gpu: {}, gpuMemory: {}, evalTps: [] },
@@ -396,6 +397,8 @@ const state = {
 };
 const HISTORY_LIMIT = 60;
 const STALE_SECONDS = 30;
+const MAX_ENERGY_SAMPLE_SECONDS = 10;
+const MAX_REASONABLE_POWER_W = 5000;
 
 function fmtNumber(value) {
   return value === null || value === undefined ? "-" : Number(value).toLocaleString();
@@ -420,13 +423,25 @@ function saveUiState() {
 
 function loadCostConfig() {
   try {
-    return { ...COST_DEFAULTS, ...JSON.parse(localStorage.getItem("llamaTrackerCost") || "{}") };
+    return cleanCostConfig({ ...COST_DEFAULTS, ...JSON.parse(localStorage.getItem("llamaTrackerCost") || "{}") });
   } catch {
     return { ...COST_DEFAULTS };
   }
 }
 function saveCostConfig(cfg) {
-  localStorage.setItem("llamaTrackerCost", JSON.stringify(cfg));
+  state.costConfig = cleanCostConfig(cfg);
+  localStorage.setItem("llamaTrackerCost", JSON.stringify(state.costConfig));
+}
+
+function cleanCostConfig(cfg) {
+  const pricePerKwh = Number(cfg.pricePerKwh);
+  const cpuBaseW = Number(cfg.cpuBaseW);
+  const baselineW = Number(cfg.baselineW);
+  return {
+    pricePerKwh: Number.isFinite(pricePerKwh) && pricePerKwh > 0 ? pricePerKwh : COST_DEFAULTS.pricePerKwh,
+    cpuBaseW: Number.isFinite(cpuBaseW) && cpuBaseW >= 0 ? cpuBaseW : COST_DEFAULTS.cpuBaseW,
+    baselineW: Number.isFinite(baselineW) && baselineW >= 0 ? baselineW : COST_DEFAULTS.baselineW,
+  };
 }
 
 function fmtCost(pence) {
@@ -435,50 +450,63 @@ function fmtCost(pence) {
 }
 
 function costForEnergyMj(mj, config) {
-  return (mj / 3600000) * config.pricePerKwh;
+  return (mj / 3600000000) * config.pricePerKwh;
+}
+
+function addEnergyFromPower(powerW, seconds) {
+  if (typeof powerW !== "number" || !Number.isFinite(powerW) || powerW < 0 || powerW > MAX_REASONABLE_POWER_W) return;
+  state.sessionEnergyMj += powerW * seconds * 1000;
 }
 
 function accumulateEnergy(metadata) {
   const energy = metadata.live_energy;
   if (!energy) return;
-  const now = energy.updated_at_unix ? energy.updated_at_unix : Date.now() / 1000;
+  const now = Date.now() / 1000;
   const gpuMj = energy.gpu_energy_counter_mj;
   const cpuPct = energy.cpu_percent;
   const gpuPower = energy.gpu_power_w;
+  const baselinePower = Number(state.costConfig.baselineW) || 0;
+  let cpuPowerW = null;
+  if (typeof cpuPct === "number") {
+    cpuPowerW = (cpuPct / 100) * state.costConfig.cpuBaseW;
+    state._currentCpuPowerW = cpuPowerW;
+  }
 
-  if (state.lastEnergy.at !== null && gpuMj !== null && gpuMj !== undefined) {
+  if (state.lastEnergy.at !== null) {
     const dt = now - state.lastEnergy.at;
-    if (dt > 0) {
-      const gpuDelta = gpuMj - state.lastEnergy.gpuMj;
-      if (gpuDelta > 0) {
+    if (dt > 0 && dt <= MAX_ENERGY_SAMPLE_SECONDS) {
+      addEnergyFromPower(baselinePower, dt);
+      const gpuDelta = gpuMj !== null && gpuMj !== undefined && state.lastEnergy.gpuMj !== null
+        ? gpuMj - state.lastEnergy.gpuMj
+        : null;
+      const maxPlausibleGpuDelta = (typeof gpuPower === "number" ? Math.max(gpuPower * 5, 1000) : MAX_REASONABLE_POWER_W) * dt * 1000;
+      if (gpuDelta !== null && gpuDelta > 0 && gpuDelta <= maxPlausibleGpuDelta) {
         state.sessionEnergyMj += gpuDelta;
+      } else if (typeof gpuPower === "number") {
+        addEnergyFromPower(gpuPower, dt);
       }
-      if (typeof cpuPct === "number") {
-        const cpuPowerW = (cpuPct / 100) * state.costConfig.cpuBaseW;
-        state.sessionEnergyMj += (cpuPowerW * dt * 1000);
-      }
+      addEnergyFromPower(cpuPowerW, dt);
     }
   }
 
   if (gpuMj !== null && gpuMj !== undefined) {
     state.lastEnergy = { gpuMj, at: now };
-  } else if (state.lastEnergy.at === null) {
+  } else {
     state.lastEnergy = { gpuMj: null, at: now };
   }
 
-  if (typeof cpuPct === "number") {
-    const cpuPowerW = (cpuPct / 100) * state.costConfig.cpuBaseW;
-    state._currentCpuPowerW = cpuPowerW;
-  }
+  state._currentBaselinePowerW = baselinePower;
 }
 
-function trackTaskCompletion(tasks) {
+function trackTasks(tasks) {
   for (const task of tasks) {
     const key = taskKey(task);
     if (!(key in state.taskStartEnergy)) {
-      state.taskStartEnergy[key] = { energy: state.sessionEnergyMj, completed: task.status === "completed" };
-    } else if (task.status === "completed" && !state.taskStartEnergy[key].completed) {
-      state.taskStartEnergy[key].completed = true;
+      state.taskStartEnergy[key] = { startEnergyMj: state.sessionEnergyMj, completedEnergyMj: null };
+    }
+    const info = state.taskStartEnergy[key];
+    if ((task.status === "completed" || task.status === "cancelled") && info.completedEnergyMj === null) {
+      info.completedEnergyMj = state.sessionEnergyMj;
     }
   }
 }
@@ -486,8 +514,8 @@ function trackTaskCompletion(tasks) {
 function perCompletionCost(task) {
   const key = taskKey(task);
   const info = state.taskStartEnergy[key];
-  if (!info || !info.completed) return null;
-  return costForEnergyMj(state.sessionEnergyMj - info.energy, state.costConfig);
+  if (!info || info.completedEnergyMj === null) return null;
+  return costForEnergyMj(Math.max(0, info.completedEnergyMj - info.startEnergyMj), state.costConfig);
 }
 
 function renderCostCard(metadata) {
@@ -500,47 +528,47 @@ function renderCostCard(metadata) {
   }
   card.style.display = "";
   const totalCost = costForEnergyMj(state.sessionEnergyMj, state.costConfig);
+  const totalKwh = state.sessionEnergyMj / 3600000000;
   const gpuPower = energy.gpu_power_w !== null && energy.gpu_power_w !== undefined ? `${energy.gpu_power_w.toFixed(1)} W` : "—";
   const cpuPower = state._currentCpuPowerW !== undefined ? `${state._currentCpuPowerW.toFixed(1)} W` : "—";
-
-  if (!state._costEditing) {
-    card.innerHTML = `
-      <h3>Cost <button id="editCost" title="Edit settings" style="float:right;background:none;border:none;cursor:pointer;font-size:16px;padding:0 4px">✏️</button></h3>
-      <div class="cost-value">${fmtCost(totalCost)}</div>
-      <div style="margin-top:6px">
-        <span class="cost-detail">GPU: <strong>${gpuPower}</strong></span>
-        <span class="cost-detail">CPU: <strong>${cpuPower}</strong></span>
-        <span class="cost-detail">Energy: <strong>${(state.sessionEnergyMj / 1000).toFixed(1)} mJ</strong></span>
-      </div>
-    `;
-    card.querySelector("#editCost").addEventListener("click", () => showCostEdit(card));
+  const baselinePower = state._currentBaselinePowerW !== undefined ? `${state._currentBaselinePowerW.toFixed(1)} W` : "—";
+  if (card.contains(document.activeElement)) {
+    card.querySelector("[data-cost-value]")?.replaceChildren(document.createTextNode(fmtCost(totalCost)));
+    card.querySelector("[data-cost-kwh]")?.replaceChildren(document.createTextNode(`${totalKwh.toFixed(6)} kWh`));
+    card.querySelector("[data-cost-gpu]")?.replaceChildren(document.createTextNode(gpuPower));
+    card.querySelector("[data-cost-cpu]")?.replaceChildren(document.createTextNode(cpuPower));
+    card.querySelector("[data-cost-base]")?.replaceChildren(document.createTextNode(baselinePower));
+    return;
   }
-}
-
-function showCostEdit(card) {
-  state._costEditing = true;
   const cfg = state.costConfig;
   card.innerHTML = `
-    <h3>Cost settings</h3>
+    <h3>Cost</h3>
+    <div class="cost-value" data-cost-value>${fmtCost(totalCost)}</div>
+    <div style="margin-top:6px">
+      <span class="cost-detail">Base: <strong data-cost-base>${baselinePower}</strong></span>
+      <span class="cost-detail">GPU: <strong data-cost-gpu>${gpuPower}</strong></span>
+      <span class="cost-detail">CPU: <strong data-cost-cpu>${cpuPower}</strong></span>
+      <span class="cost-detail">Energy: <strong data-cost-kwh>${totalKwh.toFixed(6)} kWh</strong></span>
+    </div>
     <div class="cost-editing">
       <label>Price/kWh (p): <input type="number" id="cfgPrice" value="${cfg.pricePerKwh}" step="0.5" min="0"></label>
-      <label>CPU base (W): <input type="number" id="cfgCpuBase" value="${cfg.cpuBaseW}" step="5" min="0"></label>
+      <label>CPU max (W): <input type="number" id="cfgCpuBase" value="${cfg.cpuBaseW}" step="5" min="0"></label>
+      <label>Baseline (W): <input type="number" id="cfgBaseline" value="${cfg.baselineW}" step="5" min="0"></label>
       <button id="cfgSave">Save</button>
-      <button id="cfgCancel">Cancel</button>
+      <button id="cfgReset">Reset session</button>
     </div>
   `;
   card.querySelector("#cfgSave").addEventListener("click", () => {
     const price = parseFloat(document.getElementById("cfgPrice").value);
     const cpuBase = parseFloat(document.getElementById("cfgCpuBase").value);
-    if (!isNaN(price) && price > 0 && !isNaN(cpuBase) && cpuBase > 0) {
-      state.costConfig = { pricePerKwh: price, cpuBaseW: cpuBase };
-      saveCostConfig(state.costConfig);
-    }
-    state._costEditing = false;
+    const baseline = parseFloat(document.getElementById("cfgBaseline").value);
+    saveCostConfig({ pricePerKwh: price, cpuBaseW: cpuBase, baselineW: baseline });
     render(state.data);
   });
-  card.querySelector("#cfgCancel").addEventListener("click", () => {
-    state._costEditing = false;
+  card.querySelector("#cfgReset").addEventListener("click", () => {
+    state.sessionEnergyMj = 0;
+    state.taskStartEnergy = {};
+    state.lastEnergy = { gpuMj: null, at: null };
     render(state.data);
   });
 }
@@ -553,7 +581,6 @@ function pushSample(series, value) {
 
 function rememberStats(metadata, completed) {
   accumulateEnergy(metadata);
-  trackTaskCompletion(completed || []);
   const liveCpu = metadata?.live_cpu || {};
   const liveGpu = metadata?.live_gpu || {};
   pushSample(state.history.cpu, liveCpu.cpu_percent);
@@ -767,6 +794,7 @@ function taskRow(task) {
   const progress = Math.round((task.prompt_progress || 0) * 100);
   const key = escapeHtml(taskKey(task));
   const open = state.openTaskDetails.has(taskKey(task)) ? " open" : "";
+  const cost = task.status === "completed" || task.status === "cancelled" ? fmtCost(perCompletionCost(task)) : "-";
   return `<tr>
     <td>#${task.task_id}<br><span class="muted">slot ${task.slot_id}</span></td>
     <td><span class="status">${task.status}</span></td>
@@ -775,8 +803,9 @@ function taskRow(task) {
     <td>${fmtNumber(task.generated_tokens ?? task.eval_tokens)}</td>
     <td>${fmtMs(task.total_ms)}</td>
     <td>${task.eval_tps ? task.eval_tps.toFixed(2) : "-"}</td>
+    <td>${cost}</td>
   </tr>
-  <tr class="details-row"><td colspan="7">
+  <tr class="details-row"><td colspan="8">
     <details data-task-key="${key}"${open}>
       <summary class="task-details">Details</summary>
       <div class="task-details">
@@ -789,7 +818,7 @@ function taskRow(task) {
           <div><span>Generation</span>${fmtMs(task.eval_ms)} / ${fmtNumber(task.eval_tokens)} tokens</div>
           <div><span>Gen tok/s</span>${task.eval_tps ? task.eval_tps.toFixed(2) : "-"}</div>
           <div><span>Checkpoint</span>${fmtNumber(task.checkpoints_created)} created, ${fmtNumber(task.checkpoints_restored)} restored</div>
-          <div><span>Cost</span>${task.status === "completed" ? fmtCost(perCompletionCost(task)) : "—"}</div>
+          <div><span>Cost</span>${cost}</div>
           <div><span>Request</span>${task.request ? `${escapeHtml(task.request.method)} ${escapeHtml(task.request.path)} ${escapeHtml(task.request.status)}` : "-"}</div>
           <div><span>Client</span>${task.request ? escapeHtml(task.request.client) : "-"}</div>
         </div>
@@ -802,7 +831,7 @@ function taskRow(task) {
 function renderTable(tasks, empty) {
   if (!tasks || tasks.length === 0) return `<pre>${empty}</pre>`;
   return `<table>
-    <thead><tr><th>Task</th><th>Status</th><th>Progress</th><th>Prompt</th><th>Output</th><th>Total</th><th>tok/s</th></tr></thead>
+    <thead><tr><th>Task</th><th>Status</th><th>Progress</th><th>Prompt</th><th>Output</th><th>Total</th><th>tok/s</th><th>Cost</th></tr></thead>
     <tbody>${tasks.map(taskRow).join("")}</tbody>
   </table>`;
 }
@@ -864,6 +893,7 @@ function render(data) {
   const cache = data.cache || {};
   const metadata = data.metadata || {};
   rememberStats(metadata, completed);
+  trackTasks([...active, ...completed]);
   renderCostCard(metadata);
   const completedToShow = filteredCompleted(completed);
   pruneOpenTaskDetails([...active, ...completedToShow]);
@@ -994,7 +1024,7 @@ def cpu_times() -> tuple[int, int] | None:
 
 
 def live_gpu_status() -> dict[str, Any]:
-    fields = [
+    base_fields = [
         "index",
         "name",
         "uuid",
@@ -1006,8 +1036,8 @@ def live_gpu_status() -> dict[str, Any]:
         "memory.free",
         "power.draw",
         "power.limit",
-        "energy_counter",
     ]
+    fields = [*base_fields, "energy_counter"]
     try:
         result = subprocess.run(
             ["nvidia-smi", f"--query-gpu={','.join(fields)}", "--format=csv,noheader,nounits"],
@@ -1020,8 +1050,20 @@ def live_gpu_status() -> dict[str, Any]:
         return {"available": False, "message": f"nvidia gpu not found ({exc.__class__.__name__})"}
 
     if result.returncode != 0:
-        message = (result.stderr or result.stdout or "nvidia gpu not found").strip()
-        return {"available": False, "message": f"nvidia gpu not found: {message}"}
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", f"--query-gpu={','.join(base_fields)}", "--format=csv,noheader,nounits"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError) as exc:
+            return {"available": False, "message": f"nvidia gpu not found ({exc.__class__.__name__})"}
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "nvidia gpu not found").strip()
+            return {"available": False, "message": f"nvidia gpu not found: {message}"}
+        fields = base_fields
 
     devices = []
     for line in result.stdout.splitlines():
@@ -1042,7 +1084,7 @@ def live_gpu_status() -> dict[str, Any]:
                 "memory_free_mib": to_int(item["memory.free"]),
                 "power_draw_w": to_float(item["power.draw"]),
                 "power_limit_w": to_float(item["power.limit"]),
-                "energy_counter_mj": to_float(item["energy_counter"]),
+                "energy_counter_mj": to_float(item.get("energy_counter", "")),
             }
         )
 
