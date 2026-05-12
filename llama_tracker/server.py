@@ -297,6 +297,10 @@ INDEX_HTML = """<!doctype html>
     .cost-editing button { background: #171c23; color: #edf1f5; border: 1px solid #3d4856; border-radius: 6px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
     .cost-detail { display: inline-block; margin-right: 16px; font-size: 13px; color: #9da7b2; }
     .cost-detail strong { color: #dce3eb; }
+    .cost-rates { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; margin-top: 12px; }
+    .cost-rate { background: #171c23; border: 1px solid #29313b; border-radius: 8px; padding: 9px 10px; }
+    .cost-rate span { display: block; color: #9da7b2; font-size: 12px; }
+    .cost-rate strong { display: block; margin-top: 3px; font-size: 17px; color: #dce3eb; }
     .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr); gap: 16px; }
     .panel { overflow: hidden; }
     .panel h2 { margin: 0; font-size: 15px; }
@@ -393,7 +397,8 @@ const state = {
   costConfig: loadCostConfig(),
   lastEnergy: { gpuMj: null, at: null },
   sessionEnergyMj: 0,
-  taskStartEnergy: {},
+  taskEnergy: {},
+  lastAttributionTasks: [],
 };
 const HISTORY_LIMIT = 60;
 const STALE_SECONDS = 30;
@@ -449,13 +454,24 @@ function fmtCost(pence) {
   return pence >= 100 ? `£${(pence / 100).toFixed(2)}` : `${pence.toFixed(2)}p`;
 }
 
+function fmtRate(pencePerMillion) {
+  if (pencePerMillion === null || pencePerMillion === undefined || !isFinite(pencePerMillion)) return "—";
+  return `£${(pencePerMillion / 100).toFixed(2)}/M`;
+}
+
 function costForEnergyMj(mj, config) {
   return (mj / 3600000000) * config.pricePerKwh;
 }
 
-function addEnergyFromPower(powerW, seconds) {
+function energyFromPower(powerW, seconds) {
   if (typeof powerW !== "number" || !Number.isFinite(powerW) || powerW < 0 || powerW > MAX_REASONABLE_POWER_W) return;
-  state.sessionEnergyMj += powerW * seconds * 1000;
+  return powerW * seconds * 1000;
+}
+
+function addSessionEnergy(mj) {
+  if (typeof mj !== "number" || !Number.isFinite(mj) || mj <= 0) return;
+  state.sessionEnergyMj += mj;
+  attributeEnergy(mj, state.lastAttributionTasks);
 }
 
 function accumulateEnergy(metadata) {
@@ -475,17 +491,17 @@ function accumulateEnergy(metadata) {
   if (state.lastEnergy.at !== null) {
     const dt = now - state.lastEnergy.at;
     if (dt > 0 && dt <= MAX_ENERGY_SAMPLE_SECONDS) {
-      addEnergyFromPower(baselinePower, dt);
+      addSessionEnergy(energyFromPower(baselinePower, dt));
       const gpuDelta = gpuMj !== null && gpuMj !== undefined && state.lastEnergy.gpuMj !== null
         ? gpuMj - state.lastEnergy.gpuMj
         : null;
       const maxPlausibleGpuDelta = (typeof gpuPower === "number" ? Math.max(gpuPower * 5, 1000) : MAX_REASONABLE_POWER_W) * dt * 1000;
       if (gpuDelta !== null && gpuDelta > 0 && gpuDelta <= maxPlausibleGpuDelta) {
-        state.sessionEnergyMj += gpuDelta;
+        addSessionEnergy(gpuDelta);
       } else if (typeof gpuPower === "number") {
-        addEnergyFromPower(gpuPower, dt);
+        addSessionEnergy(energyFromPower(gpuPower, dt));
       }
-      addEnergyFromPower(cpuPowerW, dt);
+      addSessionEnergy(energyFromPower(cpuPowerW, dt));
     }
   }
 
@@ -498,27 +514,124 @@ function accumulateEnergy(metadata) {
   state._currentBaselinePowerW = baselinePower;
 }
 
+function ensureTaskEnergy(task) {
+  const key = taskKey(task);
+  if (!(key in state.taskEnergy)) {
+    state.taskEnergy[key] = {
+      promptMj: 0,
+      generationMj: 0,
+      overheadMj: 0,
+      completed: false,
+      completedAt: null,
+    };
+  }
+  return state.taskEnergy[key];
+}
+
+function taskEnergyBucket(task) {
+  if (task.status === "prompt") return "promptMj";
+  if (task.status === "generating") return "generationMj";
+  return "overheadMj";
+}
+
+function attributeEnergy(mj, tasks) {
+  if (typeof mj !== "number" || !Number.isFinite(mj) || mj <= 0 || !tasks || !tasks.length) return;
+  const active = tasks.filter(task => task && task.status !== "completed" && task.status !== "cancelled");
+  if (!active.length) return;
+  const share = mj / active.length;
+  for (const task of active) {
+    const info = ensureTaskEnergy(task);
+    info[taskEnergyBucket(task)] += share;
+  }
+}
+
 function trackTasks(tasks) {
   for (const task of tasks) {
-    const key = taskKey(task);
-    if (!(key in state.taskStartEnergy)) {
-      state.taskStartEnergy[key] = { startEnergyMj: state.sessionEnergyMj, completedEnergyMj: null };
-    }
-    const info = state.taskStartEnergy[key];
-    if ((task.status === "completed" || task.status === "cancelled") && info.completedEnergyMj === null) {
-      info.completedEnergyMj = state.sessionEnergyMj;
+    const info = ensureTaskEnergy(task);
+    if ((task.status === "completed" || task.status === "cancelled") && !info.completed) {
+      info.completed = true;
+      info.completedAt = task.completed_at || new Date().toISOString();
     }
   }
 }
 
-function perCompletionCost(task) {
-  const key = taskKey(task);
-  const info = state.taskStartEnergy[key];
-  if (!info || info.completedEnergyMj === null) return null;
-  return costForEnergyMj(Math.max(0, info.completedEnergyMj - info.startEnergyMj), state.costConfig);
+function taskEnergyInfo(task) {
+  return state.taskEnergy[taskKey(task)] || null;
 }
 
-function renderCostCard(metadata) {
+function taskTotalEnergyMj(task) {
+  const info = taskEnergyInfo(task);
+  return info ? info.promptMj + info.generationMj + info.overheadMj : null;
+}
+
+function perCompletionCost(task) {
+  const totalMj = taskTotalEnergyMj(task);
+  return totalMj === null ? null : costForEnergyMj(totalMj, state.costConfig);
+}
+
+function tokensForRate(tokens) {
+  return typeof tokens === "number" && tokens > 0 ? tokens : null;
+}
+
+function rateFor(pence, tokens) {
+  const usableTokens = tokensForRate(tokens);
+  if (pence === null || pence === undefined || usableTokens === null) return null;
+  return (pence / usableTokens) * 1000000;
+}
+
+function taskCostBreakdown(task) {
+  const info = taskEnergyInfo(task);
+  if (!info) return null;
+  const promptCost = costForEnergyMj(info.promptMj, state.costConfig);
+  const generationCost = costForEnergyMj(info.generationMj, state.costConfig);
+  const overheadCost = costForEnergyMj(info.overheadMj, state.costConfig);
+  const totalCost = promptCost + generationCost + overheadCost;
+  const promptEvalTokens = task.prompt_eval_tokens ?? task.prompt_tokens;
+  const outputTokens = task.generated_tokens ?? task.eval_tokens;
+  return {
+    promptCost,
+    generationCost,
+    overheadCost,
+    totalCost,
+    fullPromptRate: rateFor(promptCost, task.prompt_tokens),
+    promptEvalRate: rateFor(promptCost, promptEvalTokens),
+    outputRate: rateFor(generationCost, outputTokens),
+    blendedRate: rateFor(totalCost, (promptEvalTokens || 0) + (outputTokens || 0)),
+  };
+}
+
+function aggregateLocalRates(tasks) {
+  let promptMj = 0;
+  let generationMj = 0;
+  let overheadMj = 0;
+  let promptTokens = 0;
+  let promptEvalTokens = 0;
+  let outputTokens = 0;
+  for (const task of tasks || []) {
+    const info = taskEnergyInfo(task);
+    if (!info) continue;
+    promptMj += info.promptMj;
+    generationMj += info.generationMj;
+    overheadMj += info.overheadMj;
+    promptTokens += task.prompt_tokens || 0;
+    promptEvalTokens += task.prompt_eval_tokens ?? task.prompt_tokens ?? 0;
+    outputTokens += task.generated_tokens ?? task.eval_tokens ?? 0;
+  }
+  const promptCost = costForEnergyMj(promptMj, state.costConfig);
+  const generationCost = costForEnergyMj(generationMj, state.costConfig);
+  const totalCost = costForEnergyMj(promptMj + generationMj + overheadMj, state.costConfig);
+  return {
+    fullPromptRate: rateFor(promptCost, promptTokens),
+    promptEvalRate: rateFor(promptCost, promptEvalTokens),
+    outputRate: rateFor(generationCost, outputTokens),
+    blendedRate: rateFor(totalCost, promptEvalTokens + outputTokens),
+    promptCost,
+    generationCost,
+    overheadCost: costForEnergyMj(overheadMj, state.costConfig),
+  };
+}
+
+function renderCostCard(metadata, completed) {
   const card = document.getElementById("costCard");
   if (!card) return;
   const energy = metadata?.live_energy;
@@ -538,9 +651,15 @@ function renderCostCard(metadata) {
     card.querySelector("[data-cost-gpu]")?.replaceChildren(document.createTextNode(gpuPower));
     card.querySelector("[data-cost-cpu]")?.replaceChildren(document.createTextNode(cpuPower));
     card.querySelector("[data-cost-base]")?.replaceChildren(document.createTextNode(baselinePower));
+    const rates = aggregateLocalRates(completed || []);
+    card.querySelector("[data-rate-input-full]")?.replaceChildren(document.createTextNode(fmtRate(rates.fullPromptRate)));
+    card.querySelector("[data-rate-input-eval]")?.replaceChildren(document.createTextNode(fmtRate(rates.promptEvalRate)));
+    card.querySelector("[data-rate-output]")?.replaceChildren(document.createTextNode(fmtRate(rates.outputRate)));
+    card.querySelector("[data-rate-blended]")?.replaceChildren(document.createTextNode(fmtRate(rates.blendedRate)));
     return;
   }
   const cfg = state.costConfig;
+  const rates = aggregateLocalRates(completed || []);
   card.innerHTML = `
     <h3>Cost</h3>
     <div class="cost-value" data-cost-value>${fmtCost(totalCost)}</div>
@@ -549,6 +668,12 @@ function renderCostCard(metadata) {
       <span class="cost-detail">GPU: <strong data-cost-gpu>${gpuPower}</strong></span>
       <span class="cost-detail">CPU: <strong data-cost-cpu>${cpuPower}</strong></span>
       <span class="cost-detail">Energy: <strong data-cost-kwh>${totalKwh.toFixed(6)} kWh</strong></span>
+    </div>
+    <div class="cost-rates">
+      <div class="cost-rate"><span>Full prompt equivalent</span><strong data-rate-input-full>${fmtRate(rates.fullPromptRate)}</strong></div>
+      <div class="cost-rate"><span>Actual prompt eval</span><strong data-rate-input-eval>${fmtRate(rates.promptEvalRate)}</strong></div>
+      <div class="cost-rate"><span>Output equivalent</span><strong data-rate-output>${fmtRate(rates.outputRate)}</strong></div>
+      <div class="cost-rate"><span>Blended equivalent</span><strong data-rate-blended>${fmtRate(rates.blendedRate)}</strong></div>
     </div>
     <div class="cost-editing">
       <label>Price/kWh (p): <input type="number" id="cfgPrice" value="${cfg.pricePerKwh}" step="0.5" min="0"></label>
@@ -567,7 +692,8 @@ function renderCostCard(metadata) {
   });
   card.querySelector("#cfgReset").addEventListener("click", () => {
     state.sessionEnergyMj = 0;
-    state.taskStartEnergy = {};
+    state.taskEnergy = {};
+    state.lastAttributionTasks = [];
     state.lastEnergy = { gpuMj: null, at: null };
     render(state.data);
   });
@@ -794,7 +920,9 @@ function taskRow(task) {
   const progress = Math.round((task.prompt_progress || 0) * 100);
   const key = escapeHtml(taskKey(task));
   const open = state.openTaskDetails.has(taskKey(task)) ? " open" : "";
-  const cost = task.status === "completed" || task.status === "cancelled" ? fmtCost(perCompletionCost(task)) : "-";
+  const breakdown = taskCostBreakdown(task);
+  const cost = breakdown ? fmtCost(breakdown.totalCost) : "-";
+  const apiRate = breakdown ? fmtRate(breakdown.blendedRate) : "-";
   return `<tr>
     <td>#${task.task_id}<br><span class="muted">slot ${task.slot_id}</span></td>
     <td><span class="status">${task.status}</span></td>
@@ -803,7 +931,7 @@ function taskRow(task) {
     <td>${fmtNumber(task.generated_tokens ?? task.eval_tokens)}</td>
     <td>${fmtMs(task.total_ms)}</td>
     <td>${task.eval_tps ? task.eval_tps.toFixed(2) : "-"}</td>
-    <td>${cost}</td>
+    <td>${cost}<br><span class="muted">${apiRate}</span></td>
   </tr>
   <tr class="details-row"><td colspan="8">
     <details data-task-key="${key}"${open}>
@@ -819,6 +947,13 @@ function taskRow(task) {
           <div><span>Gen tok/s</span>${task.eval_tps ? task.eval_tps.toFixed(2) : "-"}</div>
           <div><span>Checkpoint</span>${fmtNumber(task.checkpoints_created)} created, ${fmtNumber(task.checkpoints_restored)} restored</div>
           <div><span>Cost</span>${cost}</div>
+          <div><span>Prompt cost</span>${breakdown ? fmtCost(breakdown.promptCost) : "-"}</div>
+          <div><span>Generation cost</span>${breakdown ? fmtCost(breakdown.generationCost) : "-"}</div>
+          <div><span>Overhead cost</span>${breakdown ? fmtCost(breakdown.overheadCost) : "-"}</div>
+          <div><span>Full prompt rate</span>${breakdown ? fmtRate(breakdown.fullPromptRate) : "-"}</div>
+          <div><span>Prompt eval rate</span>${breakdown ? fmtRate(breakdown.promptEvalRate) : "-"}</div>
+          <div><span>Output rate</span>${breakdown ? fmtRate(breakdown.outputRate) : "-"}</div>
+          <div><span>Blended rate</span>${breakdown ? fmtRate(breakdown.blendedRate) : "-"}</div>
           <div><span>Request</span>${task.request ? `${escapeHtml(task.request.method)} ${escapeHtml(task.request.path)} ${escapeHtml(task.request.status)}` : "-"}</div>
           <div><span>Client</span>${task.request ? escapeHtml(task.request.client) : "-"}</div>
         </div>
@@ -894,7 +1029,8 @@ function render(data) {
   const metadata = data.metadata || {};
   rememberStats(metadata, completed);
   trackTasks([...active, ...completed]);
-  renderCostCard(metadata);
+  renderCostCard(metadata, completed);
+  state.lastAttributionTasks = active.map(task => ({ ...task }));
   const completedToShow = filteredCompleted(completed);
   pruneOpenTaskDetails([...active, ...completedToShow]);
   document.getElementById("metrics").innerHTML = renderMetricStrip(data, active, completed, cache, metadata);
