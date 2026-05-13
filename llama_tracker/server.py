@@ -357,8 +357,8 @@ INDEX_HTML = """<!doctype html>
       <summary>Server and model</summary>
       <div id="metadata"></div>
     </details>
-    <section class="metrics" id="metrics"></section>
     <div id="costCard" class="cost-card" style="display:none"></div>
+    <section class="metrics" id="metrics"></section>
     <section class="panel" style="margin-top:16px">
       <div class="panel-head">
         <h2>Active completions</h2>
@@ -399,7 +399,7 @@ const DEFAULT_UI = { completedFilter: "all", completedLimit: "8", metadataOpen: 
 const COST_DEFAULTS = { pricePerKwh: 25.5, cpuBaseW: 130, baselineW: 80 };
 const state = {
   data: null,
-  history: { cpu: [], gpu: {}, gpuMemory: {}, evalTps: [] },
+  history: { cpu: [], gpu: {}, gpuMemory: {}, evalTps: [], promptTps: [] },
   seenTps: new Set(),
   openTaskDetails: new Set(),
   loading: false,
@@ -754,6 +754,12 @@ function pushSample(series, value) {
   if (series.length > HISTORY_LIMIT) series.splice(0, series.length - HISTORY_LIMIT);
 }
 
+function pushRawSample(series, value) {
+  if (typeof value !== "number" || Number.isNaN(value)) return;
+  series.push(Math.max(0, value));
+  if (series.length > HISTORY_LIMIT) series.splice(0, series.length - HISTORY_LIMIT);
+}
+
 function rememberStats(metadata, completed) {
   accumulateEnergy(metadata);
   const liveCpu = metadata?.live_cpu || {};
@@ -771,7 +777,8 @@ function rememberStats(metadata, completed) {
   for (const task of (completed || []).slice().reverse()) {
     if (task.task_id === undefined || state.seenTps.has(task.task_id)) continue;
     state.seenTps.add(task.task_id);
-    if (typeof task.eval_tps === "number") pushSample(state.history.evalTps, task.eval_tps);
+    if (typeof task.eval_tps === "number") pushRawSample(state.history.evalTps, task.eval_tps);
+    if (typeof task.prompt_eval_tps === "number") pushRawSample(state.history.promptTps, task.prompt_eval_tps);
   }
 }
 
@@ -1077,10 +1084,23 @@ function renderMetricStrip(data, active, completed, cache, metadata) {
     cards.push(gpuCombinedCard(device, utilHistory, memHistory));
   }
 
-  const avgTps = average(state.history.evalTps);
-  cards.push(metric("tok/s", avgTps !== null ? avgTps.toFixed(2) : "-", state.history.evalTps, "completed avg", Math.max(25, ...state.history.evalTps)));
+  cards.push(tokenRateCard());
   cards.push(metric("Cache", cache.mib ? `${cache.mib.toFixed(0)} MiB` : "-"));
   return cards.join("");
+}
+
+function tokenRateCard() {
+  const genAvg = average(state.history.evalTps);
+  const promptAvg = average(state.history.promptTps);
+  const genValue = genAvg !== null ? genAvg.toFixed(2) : "-";
+  const promptValue = promptAvg !== null ? promptAvg.toFixed(2) : "-";
+  const sparkMax = Math.max(25, ...state.history.evalTps);
+  return `<div class="metric">
+    <span>tok/s (gen)</span>
+    <strong>${escapeHtml(genValue)}</strong>
+    ${sparkline(state.history.evalTps, sparkMax)}
+    <div class="vram-line"><span>Prompt <strong>${escapeHtml(promptValue)}</strong></span><small>completed avg</small></div>
+  </div>`;
 }
 
 function render(data) {
