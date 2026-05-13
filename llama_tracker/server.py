@@ -291,8 +291,12 @@ INDEX_HTML = """<!doctype html>
     .metric small { display: block; color: #9da7b2; font-size: 11px; margin-top: 4px; }
     .cost-card { background: #1b2028; border: 1px solid #303844; border-radius: 8px; padding: 14px; margin-bottom: 16px; }
     .cost-card h3 { margin: 0 0 8px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .cost-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .cost-gear { background: none; border: 0; color: #9da7b2; cursor: pointer; padding: 4px 6px; font-size: 16px; line-height: 1; border-radius: 6px; }
+    .cost-gear:hover { color: #edf1f5; background: #171c23; }
     .cost-value { font-size: 28px; font-weight: 650; color: #5bc0be; }
-    .cost-editing { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
+    .cost-editing { display: none; gap: 10px; align-items: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid #29313b; flex-wrap: wrap; }
+    .cost-editing.open { display: flex; }
     .cost-editing input { width: 80px; background: #171c23; color: #edf1f5; border: 1px solid #3d4856; border-radius: 6px; padding: 4px 8px; font: inherit; font-size: 13px; }
     .cost-editing button { background: #171c23; color: #edf1f5; border: 1px solid #3d4856; border-radius: 6px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer; }
     .cost-detail { display: inline-block; margin-right: 16px; font-size: 13px; color: #9da7b2; }
@@ -301,6 +305,13 @@ INDEX_HTML = """<!doctype html>
     .cost-rate { background: #171c23; border: 1px solid #29313b; border-radius: 8px; padding: 9px 10px; }
     .cost-rate span { display: block; color: #9da7b2; font-size: 12px; }
     .cost-rate strong { display: block; margin-top: 3px; font-size: 17px; color: #dce3eb; }
+    .cost-tokens { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-top: 10px; }
+    .cost-token { background: #171c23; border: 1px solid #29313b; border-radius: 8px; padding: 8px 10px; }
+    .cost-token span { display: block; color: #9da7b2; font-size: 11px; }
+    .cost-token strong { display: block; margin-top: 2px; font-size: 15px; color: #dce3eb; }
+    .metric .vram-line { display: flex; justify-content: space-between; align-items: baseline; margin-top: 6px; padding-top: 6px; border-top: 1px solid #29313b; font-size: 11px; color: #9da7b2; gap: 6px; }
+    .metric .vram-line strong { display: inline; margin: 0; font-size: 13px; font-weight: 650; color: #dce3eb; }
+    .metric .vram-line small { display: inline; margin: 0; color: #9da7b2; font-size: 11px; }
     .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr); gap: 16px; }
     .panel { overflow: hidden; }
     .panel h2 { margin: 0; font-size: 15px; }
@@ -342,12 +353,12 @@ INDEX_HTML = """<!doctype html>
       <h1>llama.cpp tracker</h1>
       <div class="muted" id="lastEvent">Waiting for logs</div>
     </header>
-    <div id="costCard" class="cost-card" style="display:none"></div>
-    <section class="metrics" id="metrics"></section>
-    <details class="panel" style="margin-top:16px">
+    <details class="panel" style="margin-bottom:16px">
       <summary>Server and model</summary>
       <div id="metadata"></div>
     </details>
+    <section class="metrics" id="metrics"></section>
+    <div id="costCard" class="cost-card" style="display:none"></div>
     <section class="panel" style="margin-top:16px">
       <div class="panel-head">
         <h2>Active completions</h2>
@@ -384,7 +395,7 @@ INDEX_HTML = """<!doctype html>
 
 
 WIDGET_JS = """
-const DEFAULT_UI = { completedFilter: "all", completedLimit: "8", metadataOpen: false };
+const DEFAULT_UI = { completedFilter: "all", completedLimit: "8", metadataOpen: false, costSettingsOpen: false };
 const COST_DEFAULTS = { pricePerKwh: 25.5, cpuBaseW: 130, baselineW: 80 };
 const state = {
   data: null,
@@ -399,6 +410,8 @@ const state = {
   sessionEnergyMj: 0,
   taskEnergy: {},
   lastAttributionTasks: [],
+  seenTokenTasks: new Set(),
+  sessionTokens: { cachedTokens: 0, promptEvalTokens: 0, generationTokens: 0 },
 };
 const HISTORY_LIMIT = 60;
 const STALE_SECONDS = 30;
@@ -600,6 +613,20 @@ function taskCostBreakdown(task) {
   };
 }
 
+function accumulateSessionTokens(tasks) {
+  for (const task of tasks || []) {
+    if (task.task_id === undefined || task.task_id === null) continue;
+    if (state.seenTokenTasks.has(task.task_id)) continue;
+    state.seenTokenTasks.add(task.task_id);
+    const promptTotal = task.prompt_tokens || 0;
+    const promptEval = task.prompt_eval_tokens ?? task.prompt_tokens ?? 0;
+    const output = task.generated_tokens ?? task.eval_tokens ?? 0;
+    state.sessionTokens.cachedTokens += Math.max(0, promptTotal - promptEval);
+    state.sessionTokens.promptEvalTokens += promptEval;
+    state.sessionTokens.generationTokens += output;
+  }
+}
+
 function aggregateLocalRates(tasks) {
   let promptMj = 0;
   let generationMj = 0;
@@ -645,12 +672,17 @@ function renderCostCard(metadata, completed) {
   const gpuPower = energy.gpu_power_w !== null && energy.gpu_power_w !== undefined ? `${energy.gpu_power_w.toFixed(1)} W` : "—";
   const cpuPower = state._currentCpuPowerW !== undefined ? `${state._currentCpuPowerW.toFixed(1)} W` : "—";
   const baselinePower = state._currentBaselinePowerW !== undefined ? `${state._currentBaselinePowerW.toFixed(1)} W` : "—";
+  accumulateSessionTokens(completed || []);
+  const tokens = state.sessionTokens;
   if (card.contains(document.activeElement)) {
     card.querySelector("[data-cost-value]")?.replaceChildren(document.createTextNode(fmtCost(totalCost)));
     card.querySelector("[data-cost-kwh]")?.replaceChildren(document.createTextNode(`${totalKwh.toFixed(6)} kWh`));
     card.querySelector("[data-cost-gpu]")?.replaceChildren(document.createTextNode(gpuPower));
     card.querySelector("[data-cost-cpu]")?.replaceChildren(document.createTextNode(cpuPower));
     card.querySelector("[data-cost-base]")?.replaceChildren(document.createTextNode(baselinePower));
+    card.querySelector("[data-tok-cached]")?.replaceChildren(document.createTextNode(fmtNumber(tokens.cachedTokens)));
+    card.querySelector("[data-tok-prompt]")?.replaceChildren(document.createTextNode(fmtNumber(tokens.promptEvalTokens)));
+    card.querySelector("[data-tok-gen]")?.replaceChildren(document.createTextNode(fmtNumber(tokens.generationTokens)));
     const rates = aggregateLocalRates(completed || []);
     card.querySelector("[data-rate-input-full]")?.replaceChildren(document.createTextNode(fmtRate(rates.fullPromptRate)));
     card.querySelector("[data-rate-input-eval]")?.replaceChildren(document.createTextNode(fmtRate(rates.promptEvalRate)));
@@ -660,8 +692,12 @@ function renderCostCard(metadata, completed) {
   }
   const cfg = state.costConfig;
   const rates = aggregateLocalRates(completed || []);
+  const settingsOpen = state.ui.costSettingsOpen ? " open" : "";
   card.innerHTML = `
-    <h3>Cost</h3>
+    <div class="cost-header">
+      <h3>Cost</h3>
+      <button class="cost-gear" id="cfgGear" aria-label="Cost settings" title="Settings">⚙</button>
+    </div>
     <div class="cost-value" data-cost-value>${fmtCost(totalCost)}</div>
     <div style="margin-top:6px">
       <span class="cost-detail">Base: <strong data-cost-base>${baselinePower}</strong></span>
@@ -669,13 +705,18 @@ function renderCostCard(metadata, completed) {
       <span class="cost-detail">CPU: <strong data-cost-cpu>${cpuPower}</strong></span>
       <span class="cost-detail">Energy: <strong data-cost-kwh>${totalKwh.toFixed(6)} kWh</strong></span>
     </div>
+    <div class="cost-tokens">
+      <div class="cost-token"><span>Cached tokens</span><strong data-tok-cached>${fmtNumber(tokens.cachedTokens)}</strong></div>
+      <div class="cost-token"><span>Prompt tokens</span><strong data-tok-prompt>${fmtNumber(tokens.promptEvalTokens)}</strong></div>
+      <div class="cost-token"><span>Generation tokens</span><strong data-tok-gen>${fmtNumber(tokens.generationTokens)}</strong></div>
+    </div>
     <div class="cost-rates">
       <div class="cost-rate"><span>Full prompt equivalent</span><strong data-rate-input-full>${fmtRate(rates.fullPromptRate)}</strong></div>
       <div class="cost-rate"><span>Actual prompt eval</span><strong data-rate-input-eval>${fmtRate(rates.promptEvalRate)}</strong></div>
       <div class="cost-rate"><span>Output equivalent</span><strong data-rate-output>${fmtRate(rates.outputRate)}</strong></div>
       <div class="cost-rate"><span>Blended equivalent</span><strong data-rate-blended>${fmtRate(rates.blendedRate)}</strong></div>
     </div>
-    <div class="cost-editing">
+    <div class="cost-editing${settingsOpen}" id="costSettings">
       <label>Price/kWh (p): <input type="number" id="cfgPrice" value="${cfg.pricePerKwh}" step="0.5" min="0"></label>
       <label>CPU max (W): <input type="number" id="cfgCpuBase" value="${cfg.cpuBaseW}" step="5" min="0"></label>
       <label>Baseline (W): <input type="number" id="cfgBaseline" value="${cfg.baselineW}" step="5" min="0"></label>
@@ -683,6 +724,12 @@ function renderCostCard(metadata, completed) {
       <button id="cfgReset">Reset session</button>
     </div>
   `;
+  card.querySelector("#cfgGear").addEventListener("click", () => {
+    const panel = card.querySelector("#costSettings");
+    const open = panel.classList.toggle("open");
+    state.ui.costSettingsOpen = open;
+    saveUiState();
+  });
   card.querySelector("#cfgSave").addEventListener("click", () => {
     const price = parseFloat(document.getElementById("cfgPrice").value);
     const cpuBase = parseFloat(document.getElementById("cfgCpuBase").value);
@@ -695,6 +742,8 @@ function renderCostCard(metadata, completed) {
     state.taskEnergy = {};
     state.lastAttributionTasks = [];
     state.lastEnergy = { gpuMj: null, at: null };
+    state.seenTokenTasks = new Set();
+    state.sessionTokens = { cachedTokens: 0, promptEvalTokens: 0, generationTokens: 0 };
     render(state.data);
   });
 }
@@ -994,6 +1043,23 @@ function filteredCompleted(completed) {
   return filtered.slice(0, Number(state.ui.completedLimit));
 }
 
+function gpuCombinedCard(device, utilHistory, memHistory) {
+  const index = device.index ?? "gpu";
+  const utilValue = typeof device.utilization_gpu_pct === "number" ? `${device.utilization_gpu_pct}%` : "-";
+  const memoryPct = latest(memHistory);
+  const vramPct = memoryPct !== null ? `${memoryPct.toFixed(1)}%` : "-";
+  const vramAmount = device.memory_used_mib !== undefined && device.memory_total_mib !== undefined
+    ? `${fmtNumber(device.memory_used_mib)} / ${fmtNumber(device.memory_total_mib)} MiB`
+    : "-";
+  return `<div class="metric">
+    <span>GPU ${escapeHtml(index)}</span>
+    <strong>${escapeHtml(utilValue)}</strong>
+    ${sparkline(utilHistory, 100)}
+    <div class="vram-line"><span>VRAM <strong>${escapeHtml(vramPct)}</strong></span><small>${escapeHtml(vramAmount)}</small></div>
+    ${device.name ? `<small>${escapeHtml(device.name)}</small>` : ""}
+  </div>`;
+}
+
 function renderMetricStrip(data, active, completed, cache, metadata) {
   const liveCpu = metadata.live_cpu || {};
   const liveGpu = metadata.live_gpu || {};
@@ -1008,14 +1074,11 @@ function renderMetricStrip(data, active, completed, cache, metadata) {
     const index = device.index ?? "gpu";
     const utilHistory = state.history.gpu[index] || [];
     const memHistory = state.history.gpuMemory[index] || [];
-    const memoryPct = latest(memHistory);
-    cards.push(metric(`GPU ${index}`, typeof device.utilization_gpu_pct === "number" ? `${device.utilization_gpu_pct}%` : "-", utilHistory, device.name));
-    cards.push(metric(`VRAM ${index}`, memoryPct !== null ? `${memoryPct.toFixed(1)}%` : "-", memHistory, `${fmtNumber(device.memory_used_mib)} / ${fmtNumber(device.memory_total_mib)} MiB`));
+    cards.push(gpuCombinedCard(device, utilHistory, memHistory));
   }
 
   const avgTps = average(state.history.evalTps);
   cards.push(metric("tok/s", avgTps !== null ? avgTps.toFixed(2) : "-", state.history.evalTps, "completed avg", Math.max(25, ...state.history.evalTps)));
-  cards.push(metric("Completed", fmtNumber(data.counters.completed)));
   cards.push(metric("Cache", cache.mib ? `${cache.mib.toFixed(0)} MiB` : "-"));
   return cards.join("");
 }
