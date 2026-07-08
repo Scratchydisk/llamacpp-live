@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 
+TIMESTAMP_PREFIX = re.compile(r"^\d+(?:\.\d+){3}\s+[A-Z]\s+")
 TASK_PREFIX = re.compile(
     r"^slot\s+(?P<event>[\w_]+):\s+id\s+(?P<slot>\d+)\s+\|\s+task\s+(?P<task>-?\d+)\s+\|\s*(?P<body>.*)$"
 )
@@ -59,6 +60,13 @@ PROMPT_PROGRESS = re.compile(
     r"prompt processing progress,\s+n_tokens\s+=\s+(?P<n_tokens>\d+),\s+batch\.n_tokens\s+=\s+(?P<batch>\d+),\s+progress\s+=\s+(?P<progress>[\d.]+)"
 )
 PROMPT_DONE = re.compile(r"prompt processing done,\s+n_tokens\s+=\s+(?P<n_tokens>\d+),\s+batch\.n_tokens\s+=\s+(?P<batch>\d+)")
+LIVE_PROMPT_CHUNK = re.compile(
+    r"prompt processing,\s+n_tokens\s*=\s*(?P<n_tokens>\d+),\s*progress\s*=\s*(?P<progress>[\d.]+),\s*"
+    r"t\s*=\s*[\d.]+\s*s\s*/\s*(?P<tps>[\d.]+)\s*tokens per second"
+)
+LIVE_GEN_TICK = re.compile(
+    r"n_decoded\s*=\s*(?P<n_decoded>\d+),\s*tg\s*=\s*[\d.]+\s*t/s,\s*tg_3s\s*=\s*(?P<tg_3s>[\d.]+)\s*t/s"
+)
 CHECKPOINT_CREATED = re.compile(
     r"created context checkpoint\s+(?P<index>\d+)\s+of\s+(?P<total>\d+).*n_tokens\s+=\s+(?P<n_tokens>\d+),\s+size\s+=\s+(?P<size>[\d.]+)\s+MiB"
 )
@@ -160,6 +168,7 @@ class LlamaLogParser:
         line = line.rstrip("\n")
         if not line:
             return None
+        line = TIMESTAMP_PREFIX.sub("", line, count=1)
 
         self.state.counters["lines"] += 1
         self.state.last_line = line
@@ -489,6 +498,15 @@ class LlamaLogParser:
             task.current_tokens = int(done.group("n_tokens"))
             task.prompt_batch_tokens = int(done.group("batch"))
             task.prompt_progress = 1.0
+        elif live_prompt := LIVE_PROMPT_CHUNK.search(body):
+            task.status = "prompt"
+            task.current_tokens = int(live_prompt.group("n_tokens"))
+            task.prompt_progress = float(live_prompt.group("progress"))
+            task.prompt_eval_tps = float(live_prompt.group("tps"))
+        elif live_gen := LIVE_GEN_TICK.search(body):
+            task.status = "generating"
+            task.generated_tokens = int(live_gen.group("n_decoded"))
+            task.eval_tps = float(live_gen.group("tg_3s"))
         elif sampler := SAMPLER_INIT.search(body):
             task.sampler_init_ms = float(sampler.group("ms"))
             task.prompt_tokens = int(sampler.group("total"))
@@ -499,6 +517,19 @@ class LlamaLogParser:
         elif checkpoint := CHECKPOINT_RESTORED.search(body):
             task.checkpoints_restored += 1
             task.checkpoint_mib = float(checkpoint.group("size"))
+        elif prompt_eval := PROMPT_EVAL.search(body):
+            task.prompt_eval_ms = float(prompt_eval.group("ms"))
+            task.prompt_eval_tokens = int(prompt_eval.group("tokens"))
+            task.prompt_eval_tps = float(prompt_eval.group("tps"))
+            if task.prompt_tokens is None:
+                task.prompt_tokens = task.prompt_eval_tokens
+        elif eval_match := EVAL.search(body):
+            task.eval_ms = float(eval_match.group("ms"))
+            task.eval_tokens = int(eval_match.group("tokens"))
+            task.eval_tps = float(eval_match.group("tps"))
+        elif total := TOTAL.search(body):
+            task.total_ms = float(total.group("ms"))
+            task.total_tokens = int(total.group("tokens"))
         elif release := RELEASE.search(body):
             task.final_tokens = int(release.group("n_tokens"))
             task.truncated = release.group("truncated") == "1"
