@@ -65,7 +65,8 @@ LIVE_PROMPT_CHUNK = re.compile(
     r"t\s*=\s*[\d.]+\s*s\s*/\s*(?P<tps>[\d.]+)\s*tokens per second"
 )
 LIVE_GEN_TICK = re.compile(
-    r"n_decoded\s*=\s*(?P<n_decoded>\d+),\s*tg\s*=\s*[\d.]+\s*t/s,\s*tg_3s\s*=\s*(?P<tg_3s>[\d.]+)\s*t/s"
+    r"n_decoded\s*=\s*(?P<n_decoded>\d+),\s*tg\s*=\s*(?P<tg>[\d.]+)\s*t/s"
+    r"(?:,\s*tg_3s\s*=\s*(?P<tg_3s>[\d.]+)\s*t/s)?"
 )
 CHECKPOINT_CREATED = re.compile(
     r"created context checkpoint\s+(?P<index>\d+)\s+of\s+(?P<total>\d+).*n_tokens\s+=\s+(?P<n_tokens>\d+),\s+size\s+=\s+(?P<size>[\d.]+)\s+MiB"
@@ -506,7 +507,7 @@ class LlamaLogParser:
         elif live_gen := LIVE_GEN_TICK.search(body):
             task.status = "generating"
             task.generated_tokens = int(live_gen.group("n_decoded"))
-            task.eval_tps = float(live_gen.group("tg_3s"))
+            task.eval_tps = float(live_gen.group("tg_3s") or live_gen.group("tg"))
         elif sampler := SAMPLER_INIT.search(body):
             task.sampler_init_ms = float(sampler.group("ms"))
             task.prompt_tokens = int(sampler.group("total"))
@@ -535,7 +536,11 @@ class LlamaLogParser:
             task.truncated = release.group("truncated") == "1"
             task.status = "completed" if task.status != "cancelled" else task.status
             task.completed_at = now_iso()
-            if task.prompt_tokens is not None:
+            if task.eval_tokens is not None:
+                # n_tokens is the slot's cumulative context after cache reuse;
+                # eval time reports the output generated for this request.
+                task.generated_tokens = task.eval_tokens
+            elif task.prompt_tokens is not None:
                 task.generated_tokens = max(0, task.final_tokens - task.prompt_tokens)
             self._complete_task(task)
 

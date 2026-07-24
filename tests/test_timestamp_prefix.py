@@ -39,7 +39,18 @@ def demo_live_metrics_while_task_prefixed() -> None:
     assert task.prompt_eval_tps == 1502.58, task.prompt_eval_tps
 
 
+def demo_live_generation_without_tg_3s() -> None:
+    parser = LlamaLogParser()
+    parser.parse_line("5.00.000.000 I slot launch_slot_: id  0 | task 0 | processing task, is_child = 0")
+    parser.parse_line("5.06.493.843 I slot print_timing: id  0 | task 0 | n_decoded =    100, tg =  18.06 t/s")
+    task = parser.state.active["0:0"]
+    assert task.status == "generating", task.status
+    assert task.generated_tokens == 100, task.generated_tokens
+    assert task.eval_tps == 18.06, task.eval_tps
+
+
 if __name__ == "__main__":
     demo()
     demo_live_metrics_while_task_prefixed()
+    demo_live_generation_without_tg_3s()
     print("ok")
