@@ -67,6 +67,8 @@ Replace `SERVER_IP` with the Linux server's address.
 
 ## Run With llama.cpp
 
+Add `-lv 4` to your `llama-server` command so its logs include the verbose slot/task detail this app parses.
+
 The easiest option is the launcher script. Put your normal `llama-server` command after `--`:
 
 ```bash

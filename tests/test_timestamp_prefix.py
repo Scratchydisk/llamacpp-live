@@ -22,6 +22,7 @@ def demo_live_metrics_while_task_prefixed() -> None:
     )
     task = parser.state.active["0:0"]
     assert task.current_tokens == 5832, task.current_tokens
+    assert task.prompt_tokens == 5832, task.prompt_tokens
     assert task.prompt_eval_tps == 1644.70, task.prompt_eval_tps
 
     parser.parse_line(

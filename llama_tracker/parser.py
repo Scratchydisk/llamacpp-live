@@ -502,6 +502,7 @@ class LlamaLogParser:
         elif live_prompt := LIVE_PROMPT_CHUNK.search(body):
             task.status = "prompt"
             task.current_tokens = int(live_prompt.group("n_tokens"))
+            task.prompt_tokens = task.current_tokens
             task.prompt_progress = float(live_prompt.group("progress"))
             task.prompt_eval_tps = float(live_prompt.group("tps"))
         elif live_gen := LIVE_GEN_TICK.search(body):
@@ -522,8 +523,7 @@ class LlamaLogParser:
             task.prompt_eval_ms = float(prompt_eval.group("ms"))
             task.prompt_eval_tokens = int(prompt_eval.group("tokens"))
             task.prompt_eval_tps = float(prompt_eval.group("tps"))
-            if task.prompt_tokens is None:
-                task.prompt_tokens = task.prompt_eval_tokens
+            task.prompt_tokens = task.prompt_eval_tokens
         elif eval_match := EVAL.search(body):
             task.eval_ms = float(eval_match.group("ms"))
             task.eval_tokens = int(eval_match.group("tokens"))
