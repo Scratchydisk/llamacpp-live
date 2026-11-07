@@ -25,6 +25,23 @@ The tracker currently extracts:
 - recent HTTP request completion lines
 - the latest raw log line for debugging
 
+## Dashboard Screenshots
+
+The dashboard brings server, model, and live hardware details together so you
+can verify the tracked llama.cpp instance at a glance.
+
+![Server, model, runtime, and live host metrics](docs/images/dashboard-server-overview.png)
+
+Recent completions show progress, throughput, checkpoint use, and estimated
+costs in one table, including completed and cancelled requests.
+
+![Recent completion activity and cost summary](docs/images/dashboard-completions.png)
+
+Expanding a completion exposes its timing breakdown, MTP acceptance, token
+counts, cost estimates, and the matching raw llama.cpp log lines.
+
+![Expanded completion details](docs/images/completion-details.png)
+
 ## How It Works
 
 `llama-tracker` can read logs in two ways:
