@@ -106,6 +106,23 @@ If `llama.cpp` already writes to a file:
 python3 -m llama_tracker.server /path/to/llama-server.log --host 0.0.0.0 --port 8765
 ```
 
+### Always-on monitor
+
+For a llama.cpp server that is started independently (for example by tmux or
+systemd), send its output to a stable file and start the monitor separately:
+
+```bash
+./llama-server -lv 4 -m /models/model.gguf ... >> /var/log/llama-server.log 2>&1
+scripts/run-monitor-only.sh --log-file /var/log/llama-server.log --host 127.0.0.1
+```
+
+`run-monitor-only.sh` does not start llama.cpp. It can be started before the
+log exists, stays running while llama.cpp is restarted, and follows log
+rotation or truncation. To keep it running after boot, run that command from a
+service manager such as systemd. A tracker cannot safely attach to the stdout
+pipe of an already-running process; configure the llama.cpp service to write
+to this log file (or use `run-llama-tracked.sh` when the tracker starts it).
+
 For a one-shot parse of the current file without waiting for new lines:
 
 ```bash

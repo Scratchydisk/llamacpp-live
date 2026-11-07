@@ -60,6 +60,7 @@ PROMPT_PROGRESS = re.compile(
     r"prompt processing progress,\s+n_tokens\s+=\s+(?P<n_tokens>\d+),\s+batch\.n_tokens\s+=\s+(?P<batch>\d+),\s+progress\s+=\s+(?P<progress>[\d.]+)"
 )
 PROMPT_DONE = re.compile(r"prompt processing done,\s+n_tokens\s+=\s+(?P<n_tokens>\d+),\s+batch\.n_tokens\s+=\s+(?P<batch>\d+)")
+CACHED_TOKENS = re.compile(r"cached n_tokens\s*=\s*(?P<n_tokens>\d+)")
 LIVE_PROMPT_CHUNK = re.compile(
     r"prompt processing,\s+n_tokens\s*=\s*(?P<n_tokens>\d+),\s*progress\s*=\s*(?P<progress>[\d.]+),\s*"
     r"t\s*=\s*[\d.]+\s*s\s*/\s*(?P<tps>[\d.]+)\s*tokens per second"
@@ -77,6 +78,11 @@ RELEASE = re.compile(r"stop processing:\s+n_tokens\s+=\s+(?P<n_tokens>\d+),\s+tr
 PROMPT_EVAL = re.compile(r"prompt eval time\s+=\s+(?P<ms>[\d.]+)\s+ms\s+/\s+(?P<tokens>\d+)\s+tokens.*\s+(?P<tps>[\d.]+)\s+tokens per second")
 EVAL = re.compile(r"eval time\s+=\s+(?P<ms>[\d.]+)\s+ms\s+/\s+(?P<tokens>\d+)\s+tokens.*\s+(?P<tps>[\d.]+)\s+tokens per second")
 TOTAL = re.compile(r"total time\s+=\s+(?P<ms>[\d.]+)\s+ms\s+/\s+(?P<tokens>\d+)\s+tokens")
+DRAFT_ACCEPTANCE = re.compile(
+    r"draft acceptance(?:\s+rate)?\s*=\s*(?P<rate>[\d.]+)\s*"
+    r"\(\s*(?P<accepted>\d+)\s+accepted\s*/\s*(?P<generated>\d+)\s+generated\s*\)"
+    r"(?:,\s*mean\s+(?:len|draft length)\s*=\s*(?P<mean_length>[\d.]+))?"
+)
 
 
 @dataclass
@@ -100,6 +106,10 @@ class Task:
     eval_ms: float | None = None
     eval_tokens: int | None = None
     eval_tps: float | None = None
+    draft_acceptance: float | None = None
+    draft_accepted_tokens: int | None = None
+    draft_generated_tokens: int | None = None
+    draft_mean_length: float | None = None
     total_ms: float | None = None
     total_tokens: int | None = None
     final_tokens: int | None = None
@@ -499,6 +509,11 @@ class LlamaLogParser:
             task.current_tokens = int(done.group("n_tokens"))
             task.prompt_batch_tokens = int(done.group("batch"))
             task.prompt_progress = 1.0
+        elif cached := CACHED_TOKENS.search(body):
+            task.status = "prompt"
+            task.current_tokens = int(cached.group("n_tokens"))
+            if task.prompt_tokens:
+                task.prompt_progress = min(1.0, task.current_tokens / task.prompt_tokens)
         elif live_prompt := LIVE_PROMPT_CHUNK.search(body):
             task.status = "prompt"
             task.current_tokens = int(live_prompt.group("n_tokens"))
@@ -507,12 +522,14 @@ class LlamaLogParser:
             task.prompt_eval_tps = float(live_prompt.group("tps"))
         elif live_gen := LIVE_GEN_TICK.search(body):
             task.status = "generating"
+            task.prompt_progress = 1.0
             task.generated_tokens = int(live_gen.group("n_decoded"))
             task.eval_tps = float(live_gen.group("tg_3s") or live_gen.group("tg"))
         elif sampler := SAMPLER_INIT.search(body):
             task.sampler_init_ms = float(sampler.group("ms"))
             task.prompt_tokens = int(sampler.group("total"))
             task.status = "generating"
+            task.prompt_progress = 1.0
         elif checkpoint := CHECKPOINT_CREATED.search(body):
             task.checkpoints_created += 1
             task.checkpoint_mib = float(checkpoint.group("size"))
@@ -528,6 +545,12 @@ class LlamaLogParser:
             task.eval_ms = float(eval_match.group("ms"))
             task.eval_tokens = int(eval_match.group("tokens"))
             task.eval_tps = float(eval_match.group("tps"))
+        elif acceptance := DRAFT_ACCEPTANCE.search(body):
+            task.draft_acceptance = float(acceptance.group("rate"))
+            task.draft_accepted_tokens = int(acceptance.group("accepted"))
+            task.draft_generated_tokens = int(acceptance.group("generated"))
+            mean_length = acceptance.group("mean_length")
+            task.draft_mean_length = float(mean_length) if mean_length is not None else None
         elif total := TOTAL.search(body):
             task.total_ms = float(total.group("ms"))
             task.total_tokens = int(total.group("tokens"))

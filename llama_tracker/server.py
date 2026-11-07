@@ -160,18 +160,54 @@ class TrackerApp:
         if self.log_path is None:
             return
 
-        while not self.log_path.exists() and not self._stop.is_set():
-            time.sleep(0.5)
+        # Keep trying when started before llama.cpp creates its log.  Reopen on
+        # rotation or truncation so this can be used as a long-running monitor.
+        while not self._stop.is_set():
+            try:
+                handle = self.log_path.open("r", encoding="utf-8", errors="replace")
+            except FileNotFoundError:
+                if not self.follow:
+                    return
+                time.sleep(0.5)
+                continue
+            except OSError:
+                if not self.follow:
+                    return
+                time.sleep(0.5)
+                continue
 
-        with self.log_path.open("r", encoding="utf-8", errors="replace") as handle:
-            while not self._stop.is_set():
-                line = handle.readline()
-                if not line:
+            with handle:
+                try:
+                    opened_stat = os.fstat(handle.fileno())
+                except OSError:
+                    continue
+                while not self._stop.is_set():
+                    line = handle.readline()
+                    if line:
+                        self._parse_and_publish(line)
+                        continue
                     if not self.follow:
                         return
                     time.sleep(0.25)
-                    continue
-                self._parse_and_publish(line)
+                    if self._log_file_replaced_or_truncated(handle, opened_stat):
+                        break
+
+    def _log_file_replaced_or_truncated(self, handle: TextIO, opened_stat: os.stat_result) -> bool:
+        """Return whether a followed log needs to be reopened."""
+        try:
+            current_stat = self.log_path.stat() if self.log_path is not None else None
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if current_stat is None:
+            return True
+        if (current_stat.st_dev, current_stat.st_ino) != (opened_stat.st_dev, opened_stat.st_ino):
+            return True
+        try:
+            return handle.tell() > current_stat.st_size
+        except OSError:
+            return False
 
     def _read_stream(self, stream: TextIO) -> None:
         while not self._stop.is_set():
@@ -312,6 +348,10 @@ INDEX_HTML = """<!doctype html>
     .metric .vram-line { display: flex; justify-content: space-between; align-items: baseline; margin-top: 6px; padding-top: 6px; border-top: 1px solid #29313b; font-size: 11px; color: #9da7b2; gap: 6px; }
     .metric .vram-line strong { display: inline; margin: 0; font-size: 13px; font-weight: 650; color: #dce3eb; }
     .metric .vram-line small { display: inline; margin: 0; color: #9da7b2; font-size: 11px; }
+    .metric .activity-cache { margin-top: 6px; padding-top: 6px; border-top: 1px solid #29313b; }
+    .metric .activity-cache span { font-size: 11px; }
+    .metric .activity-cache strong { margin: 1px 0 0; font-size: 16px; color: #dce3eb; }
+    .metric .activity-cache small { margin-top: 1px; }
     .grid { display: grid; grid-template-columns: minmax(0, 2fr) minmax(320px, 1fr); gap: 16px; }
     .panel { overflow: hidden; }
     .panel h2 { margin: 0; font-size: 15px; }
@@ -399,8 +439,9 @@ const DEFAULT_UI = { completedFilter: "all", completedLimit: "8", metadataOpen: 
 const COST_DEFAULTS = { pricePerKwh: 25.5, cpuBaseW: 130, baselineW: 80 };
 const state = {
   data: null,
-  history: { cpu: [], gpu: {}, gpuMemory: {}, evalTps: [], promptTps: [] },
+  history: { cpu: [], gpu: {}, gpuMemory: {}, evalTps: [], promptTps: [], mtpAcceptance: [] },
   seenTps: new Set(),
+  seenMtp: new Set(),
   openTaskDetails: new Set(),
   loading: false,
   failures: 0,
@@ -780,6 +821,12 @@ function rememberStats(metadata, completed) {
     if (typeof task.eval_tps === "number") pushRawSample(state.history.evalTps, task.eval_tps);
     if (typeof task.prompt_eval_tps === "number") pushRawSample(state.history.promptTps, task.prompt_eval_tps);
   }
+  for (const task of (completed || []).slice().reverse()) {
+    const key = `${task.slot_id}:${task.task_id}:${task.completed_at || ""}`;
+    if (state.seenMtp.has(key)) continue;
+    state.seenMtp.add(key);
+    if (typeof task.draft_acceptance === "number") pushSample(state.history.mtpAcceptance, task.draft_acceptance * 100);
+  }
 }
 
 function sparkline(values, maxValue = 100) {
@@ -979,6 +1026,9 @@ function taskRow(task) {
   const breakdown = taskCostBreakdown(task);
   const cost = breakdown ? fmtCost(breakdown.totalCost) : "-";
   const apiRate = breakdown ? fmtRate(breakdown.blendedRate) : "-";
+  const checkpoint = task.checkpoints_restored > 0
+    ? `<span class="status live">Used</span><br><span class="muted">${fmtNumber(task.checkpoints_restored)} restored</span>`
+    : "-";
   return `<tr>
     <td>#${task.task_id}<br><span class="muted">slot ${task.slot_id}</span></td>
     <td><span class="status">${task.status}</span></td>
@@ -987,9 +1037,10 @@ function taskRow(task) {
     <td>${fmtNumber(task.generated_tokens ?? task.eval_tokens)}</td>
     <td>${fmtMs(task.total_ms)}</td>
     <td>${task.eval_tps ? task.eval_tps.toFixed(2) : "-"}</td>
+    <td>${checkpoint}</td>
     <td>${cost}<br><span class="muted">${apiRate}</span></td>
   </tr>
-  <tr class="details-row"><td colspan="8">
+  <tr class="details-row"><td colspan="9">
     <details data-task-key="${key}"${open}>
       <summary class="task-details">Details</summary>
       <div class="task-details">
@@ -1001,6 +1052,9 @@ function taskRow(task) {
           <div><span>Prompt tok/s</span>${task.prompt_eval_tps ? task.prompt_eval_tps.toFixed(2) : "-"}</div>
           <div><span>Generation</span>${fmtMs(task.eval_ms)} / ${fmtNumber(task.eval_tokens)} tokens</div>
           <div><span>Gen tok/s</span>${task.eval_tps ? task.eval_tps.toFixed(2) : "-"}</div>
+          <div><span>MTP acceptance</span>${task.draft_acceptance !== null && task.draft_acceptance !== undefined ? `${(task.draft_acceptance * 100).toFixed(1)}%` : "-"}</div>
+          <div><span>MTP draft tokens</span>${task.draft_accepted_tokens !== null && task.draft_generated_tokens !== null ? `${fmtNumber(task.draft_accepted_tokens)} accepted / ${fmtNumber(task.draft_generated_tokens)} generated` : "-"}</div>
+          <div><span>MTP mean draft length</span>${task.draft_mean_length !== null && task.draft_mean_length !== undefined ? task.draft_mean_length.toFixed(2) : "-"}</div>
           <div><span>Checkpoint</span>${fmtNumber(task.checkpoints_created)} created, ${fmtNumber(task.checkpoints_restored)} restored</div>
           <div><span>Cost</span>${cost}</div>
           <div><span>Prompt cost</span>${breakdown ? fmtCost(breakdown.promptCost) : "-"}</div>
@@ -1022,7 +1076,7 @@ function taskRow(task) {
 function renderTable(tasks, empty) {
   if (!tasks || tasks.length === 0) return `<pre>${empty}</pre>`;
   return `<table>
-    <thead><tr><th>Task</th><th>Status</th><th>Progress</th><th>Prompt</th><th>Output</th><th>Total</th><th>tok/s</th><th>Cost</th></tr></thead>
+    <thead><tr><th>Task</th><th>Status</th><th>Progress</th><th>Prompt</th><th>Output</th><th>Total</th><th>tok/s</th><th>Checkpoint</th><th>Cost</th></tr></thead>
     <tbody>${tasks.map(taskRow).join("")}</tbody>
   </table>`;
 }
@@ -1072,8 +1126,8 @@ function renderMetricStrip(data, active, completed, cache, metadata) {
   const liveGpu = metadata.live_gpu || {};
   const status = statusInfo(data, metadata);
   const cards = [
-    metric("Status", `<span class="status ${status.cls}">${status.label}</span>`, null, status.detail),
-    metric("Active", active.length),
+    serverActivityCard(status, active, cache),
+    mtpAcceptanceCard(completed),
     metric("CPU", typeof liveCpu.cpu_percent === "number" ? `${liveCpu.cpu_percent.toFixed(1)}%` : "-", state.history.cpu),
   ];
 
@@ -1085,8 +1139,27 @@ function renderMetricStrip(data, active, completed, cache, metadata) {
   }
 
   cards.push(tokenRateCard());
-  cards.push(metric("Cache", cache.mib ? `${cache.mib.toFixed(0)} MiB` : "-"));
   return cards.join("");
+}
+
+function serverActivityCard(status, active, cache) {
+  const cacheValue = typeof cache.mib === "number" ? `${cache.mib.toFixed(0)} MiB` : "-";
+  const prompts = typeof cache.prompts === "number" ? `${cache.prompts} cached prompt${cache.prompts === 1 ? "" : "s"}` : "cache unavailable";
+  return `<div class="metric">
+    <span>Server activity</span>
+    <strong><span class="status ${status.cls}">${escapeHtml(status.label)}</span></strong>
+    <div class="vram-line"><span>Active <strong>${active.length}</strong></span><small>${escapeHtml(status.detail || "")}</small></div>
+    <div class="activity-cache"><span>Cache</span><strong>${escapeHtml(cacheValue)}</strong><small>${escapeHtml(prompts)}</small></div>
+  </div>`;
+}
+
+function mtpAcceptanceCard(completed) {
+  const latest = (completed || []).find(task => typeof task.draft_acceptance === "number");
+  const value = latest ? `${(latest.draft_acceptance * 100).toFixed(1)}%` : "-";
+  const note = latest
+    ? `${fmtNumber(latest.draft_accepted_tokens)} / ${fmtNumber(latest.draft_generated_tokens)} accepted`
+    : "No MTP timing yet";
+  return metric("MTP acceptance", value, state.history.mtpAcceptance, note);
 }
 
 function tokenRateCard() {

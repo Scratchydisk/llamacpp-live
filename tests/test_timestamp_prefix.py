@@ -50,8 +50,22 @@ def demo_live_generation_without_tg_3s() -> None:
     assert task.eval_tps == 18.06, task.eval_tps
 
 
+def demo_cached_token_updates_drive_prompt_progress() -> None:
+    parser = LlamaLogParser()
+    parser.parse_line("slot launch_slot_: id  0 | task 8 | processing task, is_child = 0")
+    parser.parse_line("slot update_slots: id  0 | task 8 | new prompt, n_ctx_slot = 192000, n_keep = 0, task.n_tokens = 695")
+    parser.parse_line("slot update_slots: id  0 | task 8 | cached n_tokens = 673, memory_seq_rm [673, end)")
+    task = parser.state.active["0:8"]
+    assert task.current_tokens == 673, task.current_tokens
+    assert round(task.prompt_progress * 100) == 97, task.prompt_progress
+
+    parser.parse_line("slot init_sampler: id  0 | task 8 | init sampler, took 0.08 ms, tokens: text = 695, total = 695")
+    assert task.prompt_progress == 1.0, task.prompt_progress
+
+
 if __name__ == "__main__":
     demo()
     demo_live_metrics_while_task_prefixed()
     demo_live_generation_without_tg_3s()
+    demo_cached_token_updates_drive_prompt_progress()
     print("ok")
